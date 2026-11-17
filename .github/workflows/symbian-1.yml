@@ -2379,7 +2379,7 @@ jobs:
   build-sis:
     name: Build crashrecomp.sisx
     needs: sources
-    runs-on: ${{ vars.MACOS_RUNNER || 'macos-latest' }}
+    runs-on: ${{ vars.MACOS_RUNNER || 'macos-15' }}
     timeout-minutes: 360
     steps:
       - uses: actions/download-artifact@v4
