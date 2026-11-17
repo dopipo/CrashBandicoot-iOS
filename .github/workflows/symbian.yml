@@ -1460,6 +1460,7 @@ jobs:
           void plat_ui_cp(const char *s) { g_ui_cp = s; }
           void dispatch_dump_ring(void);
           void gpu_log_stats(void);
+          void disc_log_stats(void);
 
           /* Everything we know about where the game / renderer / UI are right now (watchdog stall + CPU exception). */
           void plat_dump_state(void)
@@ -1468,6 +1469,7 @@ jobs:
                        (unsigned)g_last_call_addr, (int)g_present_calls, (int)g_paused);
               dispatch_dump_ring();
               gpu_log_stats();
+              disc_log_stats();
           }
 
           static void *wd_main(void *arg)
@@ -1544,8 +1546,14 @@ jobs:
               if (!gpu_ui_present()) { plat_ui_cp("ui: idle"); return; }
               if (n < 3) plat_log("[UI] swap #%d ...", n + 1);
               plat_ui_cp("ui: eglSwapBuffers");
+              const uint64_t ts = plat_time_ns();
               int ok = PSym_GlSwap();
+              const uint64_t dts = plat_time_ns() - ts;
               plat_ui_cp("ui: idle");
+              {
+                  static int slow;
+                  if (dts > 100000000ull && slow++ < 40) plat_log("[SLOW] eglSwapBuffers took %u ms (ui_ticks=%u)", (unsigned)(dts / 1000000ull), g_ui_ticks);
+              }
               if (n < 3) plat_log("[UI] swap #%d returned %d", n + 1, ok);
               n++;
           }
@@ -1607,6 +1615,8 @@ jobs:
               g_has_err = 1;
               return -1;
           }
+
+          void plat_dump_path(char *out, unsigned n, const char *name) { snprintf(out, n, "%s/%s", g_base, name); }
 
           int PSym_Start(const char *basedir)
           {
@@ -1988,6 +1998,119 @@ jobs:
               s += "\n/* GLES2-COMPAT applied */\n"
               return s
 
+
+          # ---------------------------------------------------------------- fewer forced flushes: 32x32 occupancy grid per bucket
+          def apply_bucket_grid(s):
+              if "BKGRID" in s:
+                  return s
+              def rep(old, new, what):
+                  nonlocal s
+                  assert s.count(old) == 1, "bucket grid anchor (%s): count=%d" % (what, s.count(old))
+                  s = s.replace(old, new, 1)
+              rep("typedef struct { Key k; int n; int x0, y0, x1, y1; GVert v[BUCKV]; } Bucket;",
+                  "typedef struct { Key k; int n; int x0, y0, x1, y1; uint32_t cells[16]; GVert v[BUCKV]; } Bucket;   /* BKGRID */",
+                  "Bucket")
+              rep("/* Copy n vertices (already carrying tp/cl) into the bucket for key k.",
+                  "/* BKGRID: 32x32-pixel cell occupancy (32 x 16 cells = 512 bits). Conservative: a primitive marks every cell its\n"
+                  " * bounding box touches, so two buckets whose cell sets are disjoint can never overlap and may be reordered. */\n"
+                  "static void bk_cells(uint32_t *m, int x0, int y0, int x1, int y1)\n"
+                  "{\n"
+                  "    for (int i = 0; i < 16; i++) m[i] = 0;\n"
+                  "    int cx0 = imax(x0 >> 5, 0), cx1 = imin(x1 >> 5, 31), cy0 = imax(y0 >> 5, 0), cy1 = imin(y1 >> 5, 15);\n"
+                  "    for (int cy = cy0; cy <= cy1; cy++) {\n"
+                  "        uint32_t mask = 0;\n"
+                  "        for (int cx = cx0; cx <= cx1; cx++) mask |= 1u << cx;\n"
+                  "        m[cy] |= mask;\n"
+                  "    }\n"
+                  "}\n"
+                  "static bool bk_hit(const uint32_t *a, const uint32_t *b)\n"
+                  "{\n"
+                  "    for (int i = 0; i < 16; i++) if (a[i] & b[i]) return true;\n"
+                  "    return false;\n"
+                  "}\n\n"
+                  "/* Copy n vertices (already carrying tp/cl) into the bucket for key k.", "helpers")
+              rep("    int i;\n    for (i = 0; i < nbk; i++)\n        if (memcmp(&bk[i].k, k, sizeof *k) == 0) break;\n",
+                  "    int i;\n    uint32_t pm[16];\n    bk_cells(pm, x0, y0, x1, y1);\n"
+                  "    for (i = 0; i < nbk; i++)\n        if (memcmp(&bk[i].k, k, sizeof *k) == 0) break;\n", "pm")
+              rep("                if (x0 < bk[j].x1 && x1 > bk[j].x0 && y0 < bk[j].y1 && y1 > bk[j].y0) { st_fr[FR_PASS]++; bad = true; break; }",
+                  "                if (bk_hit(pm, bk[j].cells)) { st_fr[FR_PASS]++; bad = true; break; }", "hit")
+              rep("        bk[i].x0 = x0; bk[i].y0 = y0; bk[i].x1 = x1; bk[i].y1 = y1;\n",
+                  "        bk[i].x0 = x0; bk[i].y0 = y0; bk[i].x1 = x1; bk[i].y1 = y1;\n        memcpy(bk[i].cells, pm, sizeof pm);\n", "init")
+              rep("        if (y1 > bk[i].y1) bk[i].y1 = y1;\n    }\n",
+                  "        if (y1 > bk[i].y1) bk[i].y1 = y1;\n        for (int q = 0; q < 16; q++) bk[i].cells[q] |= pm[q];\n    }\n", "grow")
+              return s
+
+
+          # ---------------------------------------------------------------- texture diagnostics (logs + VRAM dumps)
+          def apply_tex_diag(s):
+              if "TEXDIAG" in s:
+                  return s
+              def rep(old, new, what):
+                  nonlocal s
+                  assert s.count(old) == 1, "texdiag anchor (%s): count=%d" % (what, s.count(old))
+                  s = s.replace(old, new, 1)
+              rep('    plat_log("[GPU] GL_RENDERER=%s", (const char *)glGetString(GL_RENDERER));\n',
+                  '    plat_log("[GPU] GL_RENDERER=%s", (const char *)glGetString(GL_RENDERER));\n'
+                  '    {   /* TEXDIAG */\n'
+                  '        const char *e = (const char *)glGetString(GL_EXTENSIONS); size_t el = e ? strlen(e) : 0;\n'
+                  '        GLint iv[4] = {0, 0, 0, 0};\n'
+                  '        plat_log("[GPU] GL_VERSION=%s | VENDOR=%s | GLSL=%s", (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));\n'
+                  '        for (size_t o = 0; o < el && o < 1600; o += 180) plat_log("[GPU] EXT[%u] %.180s", (unsigned)(o / 180), e + o);\n'
+                  '        glGetIntegerv(GL_MAX_TEXTURE_SIZE, iv); glGetIntegerv(GL_MAX_VARYING_VECTORS, iv + 1);\n'
+                  '        glGetIntegerv(GL_MAX_FRAGMENT_UNIFORM_VECTORS, iv + 2); glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, iv + 3);\n'
+                  '        plat_log("[GPU] limits: maxTex=%d varyings=%d fragUniforms=%d vattribs=%d", iv[0], iv[1], iv[2], iv[3]);\n'
+                  '        GLint r[2] = {0, 0}, pp = 0;\n'
+                  '        glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_MEDIUM_FLOAT, r, &pp);\n'
+                  '        plat_log("[GPU] fragment mediump: range=2^%d precision=%d bits", (int)r[1], (int)pp);\n'
+                  '    }\n', "gl info")
+              # dump + stale-snapshot check
+              rep("static void upload_piece(int x, int y, int w, int h, const void *px)\n",
+                  "extern void plat_dump_path(char *out, unsigned n, const char *name);\n"
+                  "/* TEXDIAG: at a few frames write VRAM (render target) as 16-bit words to vram_<frame>.bin and compare it with the\n"
+                  " * sampling snapshot (tex_b): stale snapshot = wrong textures. */\n"
+                  "static void diag_vram(unsigned frame)\n"
+                  "{\n"
+                  "    read_rect_rgba(0, 0, VRAM_W, VRAM_H, scr_b);\n"
+                  "    glBindFramebuffer(GL_FRAMEBUFFER, fbo_b);\n"
+                  "    glPixelStorei(GL_PACK_ALIGNMENT, 4);\n"
+                  "    glReadPixels(0, 0, VRAM_W, VRAM_H, GL_RGBA, GL_UNSIGNED_BYTE, scr_a);\n"
+                  "    gl_invalidate();\n"
+                  "    uint16_t *w = (uint16_t *)scr_c;\n"
+                  "    unsigned diff = 0, outside = 0, ax0 = 9999, ay0 = 9999, ax1 = 0, ay1 = 0, zero = 0;\n"
+                  "    for (int y = 0; y < VRAM_H; y++) for (int x = 0; x < VRAM_W; x++) {\n"
+                  "        const uint8_t *a = scr_b + ((size_t)y * VRAM_W + x) * 4, *b = scr_a + ((size_t)y * VRAM_W + x) * 4;\n"
+                  "        w[(size_t)y * VRAM_W + x] = (uint16_t)((a[0] >> 3) | ((a[1] >> 3) << 5) | ((a[2] >> 3) << 10) | ((a[3] >= 128) << 15));\n"
+                  "        if (!(a[0] | a[1] | a[2] | a[3])) zero++;\n"
+                  "        if (memcmp(a, b, 4)) {\n"
+                  "            diff++;\n"
+                  "            if (x >= 640 || y >= 480) outside++;\n"
+                  "            if ((unsigned)x < ax0) ax0 = x; if ((unsigned)x > ax1) ax1 = x;\n"
+                  "            if ((unsigned)y < ay0) ay0 = y; if ((unsigned)y > ay1) ay1 = y;\n"
+                  "        }\n"
+                  "    }\n"
+                  "    plat_log(\"[TEXDIAG] frame %u: VRAM zero-words=%u, target!=snapshot words=%u (outside fb area=%u) bbox=(%u,%u)-(%u,%u)\", frame, zero, diff, outside, ax0, ay0, ax1, ay1);\n"
+                  "    char path[460]; char nm[32]; snprintf(nm, sizeof nm, \"vram_%u.bin\", frame);\n"
+                  "    plat_dump_path(path, sizeof path, nm);\n"
+                  "    FILE *f = fopen(path, \"wb\");\n"
+                  "    if (f) { size_t n = fwrite(w, 2, (size_t)VRAM_W * VRAM_H, f); fclose(f); plat_log(\"[TEXDIAG] wrote %s (%u words)\", nm, (unsigned)n); }\n"
+                  "    else plat_log(\"[TEXDIAG] cannot write %s\", nm);\n"
+                  "}\n\n"
+                  "static void upload_piece(int x, int y, int w, int h, const void *px)\n", "dump fn")
+              rep("    st_frames++;\n",
+                  "    st_frames++;\n"
+                  "    if (st_frames == 150 || st_frames == 600 || st_frames == 1500) diag_vram(st_frames);\n", "hook")
+              # per-primitive parameters of the first textured prims
+              rep("    for (int i = 0; i < n; i++) { tv[i].tpw = tpw; tv[i].clw = clw; }\n",
+                  "    for (int i = 0; i < n; i++) { tv[i].tpw = tpw; tv[i].clw = clw; }\n"
+                  "    if (tex) {   /* TEXDIAG */\n"
+                  "        static unsigned np; np++;\n"
+                  "        if (np <= 40 || (np % 20000) == 0)\n"
+                  "            plat_log(\"[TEXDIAG] prim#%u n=%d depth=%d raw=%d semi=%d dither=%d tp=(%d,%d) clut=(%d,%d) uv0=(%.1f,%.1f) uv1=(%.1f,%.1f) uv2=(%.1f,%.1f) xy0=(%.0f,%.0f) tpw=%.0f clw=%.0f\",\n"
+                  "                     np, n, (int)depth, raw ? 1 : 0, semi ? 1 : 0, dither ? 1 : 0, (int)tp_x, (int)tp_y, (int)clutx, (int)cluty,\n"
+                  "                     v[0].u, v[0].v, v[1].u, v[1].v, v[n > 2 ? 2 : 1].u, v[n > 2 ? 2 : 1].v, v[0].x, v[0].y, tpw, clw);\n"
+                  "    }\n", "prim log")
+              return s
+
           # ---------------------------------------------------------------- UI-thread display (Symbian: the emulation thread must not touch the window)
           def apply_ui_present(s):
               if "gpu_ui_present" in s:
@@ -2003,6 +2126,14 @@ jobs:
           static volatile bool pres_rgb24, pres_en;
           static volatile unsigned pres_seq;
 
+          static void slow_present(uint64_t t0, uint64_t t1, uint64_t t2)
+          {
+              static int logged;
+              if ((t1 - t0 > 100000000ull || t2 - t1 > 100000000ull) && logged++ < 40)
+                  plat_log("[SLOW] present #%u: flush_batch %u ms, glFlush %u ms (draws=%u tris=%u uploads=%u fills=%u)", st_frames + 1,
+                           (unsigned)((t1 - t0) / 1000000ull), (unsigned)((t2 - t1) / 1000000ull), st_draws, st_tris, st_uploads, st_fills);
+          }
+
           void gpu_log_stats(void)
           {
               plat_log("[GPU] stats: frames=%u published=%u draws=%u tris=%u syncs=%u uploads=%u reads=%u fills=%u copies=%u ready=%d",
@@ -2016,6 +2147,7 @@ jobs:
               const unsigned seq = pres_seq;
               if (seq == seen || !pd.id || !tex_a) return 0;
               seen = seq;
+              const uint64_t t_ui0 = plat_time_ns();
               int dx = pres_dx, dy = pres_dy, dw = pres_dw, dh = pres_dh;
               const bool rgb24 = pres_rgb24, enabled = pres_en;
               int fbo = 0, sw = 0, sh = 0;
@@ -2054,6 +2186,11 @@ jobs:
                            logged, dx, dy, dw, dh, enabled ? 1 : 0, rgb24 ? 1 : 0, sw, sh, (unsigned)glGetError());
               }
               plat_ui_cp("ui: drawn");
+              {
+                  static int slow;
+                  const uint64_t dt = plat_time_ns() - t_ui0;
+                  if (dt > 100000000ull && slow++ < 40) plat_log("[SLOW] ui display pass took %u ms", (unsigned)(dt / 1000000ull));
+              }
               return 1;
           }
 
@@ -2067,6 +2204,15 @@ jobs:
                      "    }\n\n")
               s = s[:a] + ui + s[a:c0] + pub + s[c1:]
               for old, new in (
+                  ("    uint64_t t_begin = plat_time_ns();\n    flush_batch();\n    glFlush();",
+                   "    uint64_t t_begin = plat_time_ns();\n    flush_batch();\n    const uint64_t t_fb = plat_time_ns();\n    glFlush();\n    slow_present(t_begin, t_fb, plat_time_ns());"),
+                  ("static void upload_words(int x, int y, int w, int h, const uint16_t *src)\n{",
+                   "static void upload_words_impl(int x, int y, int w, int h, const uint16_t *src);\n"
+                   "static void upload_words(int x, int y, int w, int h, const uint16_t *src)\n{\n"
+                   "    const uint64_t t0 = plat_time_ns();\n    upload_words_impl(x, y, w, h, src);\n    const uint64_t dt = plat_time_ns() - t0;\n"
+                   "    static int logged;\n    if (dt > 100000000ull && logged++ < 20)\n"
+                   "        plat_log(\"[SLOW] VRAM upload %dx%d at (%d,%d) took %u ms\", w, h, x, y, (unsigned)(dt / 1000000ull));\n}\n\n"
+                   "static void upload_words_impl(int x, int y, int w, int h, const uint16_t *src)\n{"),
                   ("void plat_gl_screen(int *fbo, int *w, int *h);\n",
                    "void plat_gl_screen(int *fbo, int *w, int *h);\nvoid plat_cp(const char *stage);        /* breadcrumbs for crash.log (psx_sym.c) */\nvoid plat_ui_cp(const char *stage);\n"),
                   ("    GLuint v = compile_shader(GL_VERTEX_SHADER, vs, name);\n",
@@ -2109,11 +2255,63 @@ jobs:
               assert old in s, "disc.c pread"
               s = s.replace(old, "    ssize_t n = z3_pread(t->fd, out, (size_t)want, (off_t)pos);")
               anchor = "void disc_read_sector_data("
-              helper = ("static pthread_mutex_t g_disc_mx = PTHREAD_MUTEX_INITIALIZER;\n"
-                        "static ssize_t z3_pread(int fd, void *buf, size_t n, off_t pos)\n{\n"
-                        "    ssize_t r = -1;\n    pthread_mutex_lock(&g_disc_mx);\n"
-                        "    if (lseek(fd, pos, SEEK_SET) == pos) r = read(fd, buf, n);\n"
-                        "    pthread_mutex_unlock(&g_disc_mx);\n    return r;\n}\n\n")
+              helper = r"""/* Symbian file I/O costs several ms per call: read 128 KB blocks and serve the 2048-byte sectors from a 2-slot cache
+           * (one slot for the data stream, one for the XA audio stream). */
+          #define Z3_RC_SLOTS 2
+          #define Z3_RC_SIZE (128 * 1024)
+          static pthread_mutex_t g_disc_mx = PTHREAD_MUTEX_INITIALIZER;
+          static struct { uint8_t *buf; int fd; off_t pos; size_t len; } g_rc[Z3_RC_SLOTS];
+          static int g_rc_next;
+          static unsigned g_dr_calls, g_dr_misses, g_dr_slow;
+          static uint64_t g_dr_ns, g_dr_bytes;
+
+          void disc_log_stats(void)
+          {
+              plat_log("[DISC] sector reads=%u cache-misses=%u block bytes=%u read time=%u ms slow(>100ms)=%u", g_dr_calls, g_dr_misses,
+             (unsigned)g_dr_bytes, (unsigned)(g_dr_ns / 1000000ull), g_dr_slow);
+          }
+
+          static ssize_t z3_pread(int fd, void *buf, size_t n, off_t pos)
+          {
+              ssize_t r = -1;
+              pthread_mutex_lock(&g_disc_mx);
+              g_dr_calls++;
+              for (int i = 0; i < Z3_RC_SLOTS && r < 0; i++)
+                  if (g_rc[i].buf && g_rc[i].fd == fd && pos >= g_rc[i].pos && (size_t)(pos - g_rc[i].pos) + n <= g_rc[i].len) {
+            memcpy(buf, g_rc[i].buf + (size_t)(pos - g_rc[i].pos), n);
+            r = (ssize_t)n;
+                  }
+              if (r < 0) {
+                  const uint64_t t0 = plat_time_ns();
+                  const int sl = g_rc_next;
+                  g_dr_misses++;
+                  if (n <= Z3_RC_SIZE / 2) {
+            if (!g_rc[sl].buf) g_rc[sl].buf = (uint8_t *)malloc(Z3_RC_SIZE);
+            g_rc[sl].fd = -1;
+            if (g_rc[sl].buf && lseek(fd, pos, SEEK_SET) == pos) {
+                ssize_t got = read(fd, g_rc[sl].buf, Z3_RC_SIZE);
+                if (got > 0) {
+                    size_t c = (size_t)got < n ? (size_t)got : n;
+                    memcpy(buf, g_rc[sl].buf, c);
+                    r = (ssize_t)c;
+                    g_dr_bytes += (uint64_t)got;
+                    if ((size_t)got >= n) { g_rc[sl].fd = fd; g_rc[sl].pos = pos; g_rc[sl].len = (size_t)got; g_rc_next = (sl + 1) % Z3_RC_SLOTS; }
+                }
+            }
+                  }
+                  if (r < 0 && lseek(fd, pos, SEEK_SET) == pos) r = read(fd, buf, n);   /* big request or cache failure: plain read */
+                  const uint64_t dt = plat_time_ns() - t0;
+                  g_dr_ns += dt;
+                  if (dt > 100000000ull) {
+            g_dr_slow++;
+            if (g_dr_slow <= 20) plat_log("[SLOW] disc read: %u bytes at %u KB took %u ms", (unsigned)n, (unsigned)(pos / 1024), (unsigned)(dt / 1000000ull));
+                  }
+              }
+              pthread_mutex_unlock(&g_disc_mx);
+              return r;
+          }
+
+          """
               assert anchor in s
               s = s.replace(anchor, helper + anchor, 1)
               wr(p, s)
@@ -2180,6 +2378,8 @@ jobs:
               assert "glCopyTexSubImage2D(GL_TEXTURE_2D" not in s
           s = apply_gles2_compat(s)
           s = apply_ui_present(s)
+          s = apply_bucket_grid(s)
+          s = apply_tex_diag(s)
           wr(p, s)
 
           # ---------------------------------------------------------------- dispatch.c: stage breadcrumbs + first-frame log
